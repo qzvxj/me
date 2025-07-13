@@ -1,0 +1,608 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Audio Visualizer</title>
+  <style>
+    html, body { margin: 0; background: black; overflow: hidden; }
+    canvas { position: absolute; top: 0; left: 0; width: 100vw; height: 100vh; }
+    
+    .notification {
+      position: fixed;
+      top: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0,0,0,0.8);
+      color: white;
+      padding: 10px 20px;
+      border-radius: 5px;
+      border: 1px solid rgba(255,255,255,0.3);
+      z-index: 100;
+      opacity: 0;
+      transition: opacity 0.3s;
+      max-width: 80%;
+      text-align: center;
+    }
+    .notification.show {
+      opacity: 1;
+    }
+    
+    .dialog {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      background: rgba(0,0,0,0.9);
+      color: white;
+      padding: 20px;
+      border-radius: 5px;
+      border: 1px solid rgba(255,255,255,0.3);
+      z-index: 100;
+      text-align: center;
+      max-width: 80%;
+    }
+    .dialog button {
+      background: rgba(255,255,255,0.2);
+      color: white;
+      border: 1px solid white;
+      padding: 8px 15px;
+      margin: 5px;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <!-- Only show content if on correct domain -->
+  <div id="content" style="display: none;">
+    <canvas id="canvas"></canvas>
+    <div id="notification" class="notification"></div>
+    <div id="dialog" class="dialog" style="display: none;">
+      <p id="dialogMessage"></p>
+      <div>
+        <button id="confirmMic">Yes, correct mic</button>
+        <button id="tryAnotherMic">Try another</button>
+      </div>
+    </div>
+  </div>
+  
+  <!-- Show message if not on correct domain -->
+  <div id="domainError" style="display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); color: white; text-align: center;">
+    <h1>This application only works on https://dregs-forever.github.io/</h1>
+  </div>
+
+  <script>
+    // Domain check
+    const allowedDomains = ['dregs-forever.github.io', 'localhost'];
+    const isAllowedDomain = allowedDomains.includes(window.location.hostname) && 
+                          (window.location.protocol === 'https:' || window.location.hostname === 'localhost');
+
+    if (isAllowedDomain) {
+      document.getElementById('content').style.display = 'block';
+      initApplication();
+    } else {
+      document.getElementById('domainError').style.display = 'block';
+    }
+
+    function initApplication() {
+      // Anti-save protection
+      document.addEventListener('keydown', function(e) {
+        if (e.ctrlKey && e.key === 's') {
+          e.preventDefault();
+        }
+      });
+      
+      // PIP support
+      let pipVideo = null;
+      
+      function setupPIP() {
+        if (!('pictureInPictureEnabled' in document)) return;
+        
+        document.addEventListener('enterpictureinpicture', (event) => {
+          // Create video element when entering PIP
+          pipVideo = document.createElement('video');
+          pipVideo.muted = true;
+          pipVideo.autoplay = true;
+          
+          // Capture canvas stream
+          const canvas = document.getElementById('canvas');
+          const stream = canvas.captureStream(30);
+          pipVideo.srcObject = stream;
+          
+          // Replace the PIP window content with our video
+          event.pictureInPictureWindow.document.body.appendChild(pipVideo);
+        });
+        
+        document.addEventListener('leavepictureinpicture', () => {
+          // Clean up when PIP closes
+          if (pipVideo) {
+            pipVideo.srcObject.getTracks().forEach(track => track.stop());
+            pipVideo.remove();
+            pipVideo = null;
+          }
+        });
+      }
+      
+      // Initialize PIP support
+      setupPIP();
+
+      const canvas = document.getElementById('canvas');
+      const ctx = canvas.getContext('2d');
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+
+      // Visualizer settings
+      let flashIntensity = 0.3;
+      let particlesCount = 3000;
+      let volumeBoost = 5.0;
+      let effectIntensity = 2.0;
+      let audioData = new Uint8Array(128);
+
+      // Visual elements
+      let particles = [];
+      let lightningBolts = [];
+      let lines = [];
+      let waves = [];
+      let circles = [];
+      let angle3D = 0;
+      let pulse = 0;
+      let time = 0;
+
+      // Audio context
+      let audioCtx, analyser;
+      let currentStream = null;
+
+      // UI functions
+      function showNotification(message, duration = 3000) {
+        const notification = document.getElementById('notification');
+        notification.textContent = message;
+        notification.classList.add('show');
+        setTimeout(() => notification.classList.remove('show'), duration);
+      }
+
+      // Storage functions
+      function getStoredMic() {
+        return localStorage.getItem('preferredMic');
+      }
+
+      function storeMic(deviceId) {
+        localStorage.setItem('preferredMic', deviceId);
+      }
+
+      // Audio functions
+      async function getMicrophones() {
+        try {
+          // Request permission once
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          stream.getTracks().forEach(track => track.stop());
+          
+          const devices = await navigator.mediaDevices.enumerateDevices();
+          return devices
+            .filter(device => device.kind === 'audioinput')
+            .sort((a, b) => {
+              // Prioritize devices with "B2" in the name
+              const aHasB2 = a.label.toLowerCase().includes('b2');
+              const bHasB2 = b.label.toLowerCase().includes('b2');
+              if (aHasB2 && !bHasB2) return -1;
+              if (!aHasB2 && bHasB2) return 1;
+              return 0;
+            });
+        } catch (e) {
+          console.error('Error getting microphones:', e);
+          showNotification("Microphone access denied");
+          return [];
+        }
+      }
+
+      async function testMicrophoneVolume(deviceId) {
+        try {
+          // Cleanup previous stream if exists
+          if (currentStream) {
+            currentStream.getTracks().forEach(track => track.stop());
+          }
+
+          const constraints = deviceId ? 
+            { audio: { deviceId: { exact: deviceId } } } : 
+            { audio: true };
+          
+          const stream = await navigator.mediaDevices.getUserMedia(constraints);
+          currentStream = stream;
+          
+          const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+          const source = audioCtx.createMediaStreamSource(stream);
+          const analyser = audioCtx.createAnalyser();
+          analyser.fftSize = 32;
+          source.connect(analyser);
+          
+          const data = new Uint8Array(analyser.frequencyBinCount);
+          
+          // Wait for microphone initialization
+          await new Promise(resolve => setTimeout(resolve, 500));
+          
+          // Measure volume over 1.5 seconds
+          let maxVolume = 0;
+          let measurements = 0;
+          let totalVolume = 0;
+          
+          for (let i = 0; i < 15; i++) {
+            analyser.getByteFrequencyData(data);
+            const volume = data.reduce((a, b) => a + b, 0) / data.length;
+            maxVolume = Math.max(maxVolume, volume);
+            totalVolume += volume;
+            measurements++;
+            await new Promise(resolve => setTimeout(resolve, 100));
+          }
+          
+          // Cleanup
+          source.disconnect();
+          
+          return {
+            deviceId,
+            maxVolume,
+            avgVolume: totalVolume / measurements
+          };
+        } catch (e) {
+          console.error('Error testing microphone:', e);
+          return null;
+        }
+      }
+
+      async function confirmMicrophone(device) {
+        return new Promise((resolve) => {
+          const dialog = document.getElementById('dialog');
+          const dialogMessage = document.getElementById('dialogMessage');
+          
+          dialogMessage.textContent = `Selected microphone: ${device.label || 'Default'}\nIs this correct?`;
+          dialog.style.display = 'block';
+          
+          const cleanUp = () => {
+            dialog.style.display = 'none';
+            document.getElementById('confirmMic').onclick = null;
+            document.getElementById('tryAnotherMic').onclick = null;
+          };
+          
+          document.getElementById('confirmMic').onclick = () => {
+            cleanUp();
+            storeMic(device.deviceId);
+            resolve(device.deviceId);
+          };
+          
+          document.getElementById('tryAnotherMic').onclick = () => {
+            cleanUp();
+            resolve(null);
+          };
+        });
+      }
+
+      async function selectBestMicrophone() {
+        showNotification("Detecting microphones...");
+        
+        // Get all microphones (sorted with B2 priority)
+        const microphones = await getMicrophones();
+        if (microphones.length === 0) {
+          showNotification("No microphones found");
+          return null;
+        }
+        
+        // Check stored microphone first
+        const storedMicId = getStoredMic();
+        if (storedMicId) {
+          const storedMic = microphones.find(m => m.deviceId === storedMicId);
+          if (storedMic) {
+            showNotification(`Testing stored microphone: ${storedMic.label || 'Default'}`);
+            const testResult = await testMicrophoneVolume(storedMicId);
+            if (testResult && testResult.maxVolume > 15) { // Threshold for background noise
+              const confirmed = await confirmMicrophone(storedMic);
+              if (confirmed) return confirmed;
+            }
+          }
+        }
+        
+        // Test all microphones to find the best one
+        let bestMic = null;
+        let bestVolume = 15; // Minimum volume threshold
+        
+        for (const mic of microphones) {
+          showNotification(`Testing: ${mic.label || 'Default microphone'}`);
+          
+          const result = await testMicrophoneVolume(mic.deviceId);
+          if (!result) continue;
+          
+          showNotification(`${mic.label || 'Mic'}: Volume ${result.maxVolume.toFixed(1)}`);
+          
+          // Prefer B2 mics even if they have slightly lower volume
+          const isB2 = mic.label.toLowerCase().includes('b2');
+          const volumeScore = result.maxVolume * (isB2 ? 1.5 : 1);
+          
+          if (volumeScore > bestVolume) {
+            bestVolume = volumeScore;
+            bestMic = mic;
+          }
+        }
+        
+        if (!bestMic) {
+          showNotification("No active microphone found");
+          return null;
+        }
+        
+        // Confirm with user
+        const confirmed = await confirmMicrophone(bestMic);
+        return confirmed || null;
+      }
+
+      async function initAudio() {
+        try {
+          const deviceId = await selectBestMicrophone();
+          
+          const constraints = deviceId ? 
+            { audio: { deviceId: { exact: deviceId } } } : 
+            { audio: true };
+          
+          const stream = await navigator.mediaDevices.getUserMedia(constraints);
+          currentStream = stream;
+          
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+          const source = audioCtx.createMediaStreamSource(stream);
+          analyser = audioCtx.createAnalyser();
+          analyser.fftSize = 256;
+          source.connect(analyser);
+          
+          const mic = (await getMicrophones()).find(m => m.deviceId === deviceId);
+          showNotification(`Using: ${mic?.label || 'Default microphone'}`);
+        } catch (e) {
+          console.error('Audio initialization failed:', e);
+          showNotification("Audio setup failed");
+        }
+      }
+
+      // Visualizer classes and functions
+      class Particle {
+        constructor() {
+          this.reset();
+        }
+        reset() {
+          this.x = Math.random() * canvas.width;
+          this.y = Math.random() * canvas.height;
+          this.z = Math.random() * canvas.width;
+          this.size = Math.random() * 3 + 1;
+          this.speed = Math.random() * 3 + 0.5;
+          this.life = Math.random() * 100 + 50;
+        }
+        update() {
+          this.z -= this.speed * effectIntensity;
+          this.life--;
+          if (this.z <= 0 || this.life <= 0) this.reset();
+        }
+        draw() {
+          const scale = canvas.width / this.z;
+          const x2D = (this.x - canvas.width / 2) * scale + canvas.width / 2;
+          const y2D = (this.y - canvas.height / 2) * scale + canvas.height / 2;
+          const size = this.size * scale;
+          ctx.fillStyle = `rgba(255,255,255,${this.life/150})`;
+          ctx.beginPath();
+          ctx.arc(x2D, y2D, size, 0, 2 * Math.PI);
+          ctx.fill();
+        }
+      }
+
+      function createParticles(count) {
+        particles = [];
+        for (let i = 0; i < count; i++) {
+          particles.push(new Particle());
+        }
+      }
+
+      function createLightning() {
+        for (let j = 0; j < 2; j++) {
+          const bolt = [];
+          let x = Math.random() * canvas.width;
+          let y = 0;
+          const segments = 15 + Math.floor(Math.random() * 10);
+          for (let i = 0; i < segments; i++) {
+            x += (Math.random() - 0.5) * 60 * effectIntensity;
+            y += Math.random() * 50 * effectIntensity;
+            bolt.push({ x, y });
+          }
+          lightningBolts.push({ points: bolt, alpha: 0.8, width: 1 + Math.random() * 2 });
+        }
+      }
+
+      function drawLightning() {
+        lightningBolts = lightningBolts.filter(b => b.alpha > 0);
+        lightningBolts.forEach(b => {
+          ctx.strokeStyle = `rgba(255,255,255,${b.alpha})`;
+          ctx.lineWidth = b.width;
+          ctx.beginPath();
+          ctx.moveTo(b.points[0].x, b.points[0].y);
+          b.points.forEach(p => ctx.lineTo(p.x, p.y));
+          ctx.stroke();
+          b.alpha -= 0.05 * effectIntensity;
+        });
+      }
+
+      function createLine() {
+        for (let i = 0; i < 3 * effectIntensity; i++) {
+          lines.push({
+            x1: Math.random() * canvas.width,
+            y1: Math.random() * canvas.height,
+            x2: Math.random() * canvas.width,
+            y2: Math.random() * canvas.height,
+            alpha: 0.6 + Math.random() * 0.4,
+            width: 0.5 + Math.random() * 2
+          });
+        }
+      }
+
+      function drawLines() {
+        lines = lines.filter(l => l.alpha > 0);
+        lines.forEach(l => {
+          ctx.strokeStyle = `rgba(255,255,255,${l.alpha})`;
+          ctx.lineWidth = l.width;
+          ctx.beginPath();
+          ctx.moveTo(l.x1, l.y1);
+          ctx.lineTo(l.x2, l.y2);
+          ctx.stroke();
+          l.alpha -= 0.01 * effectIntensity;
+        });
+      }
+
+      function createWave() {
+        if (waves.length > 5) return;
+        waves.push({
+          x: Math.random() * canvas.width,
+          y: Math.random() * canvas.height,
+          radius: 5,
+          alpha: 0.8,
+          speed: 1 + Math.random() * 2
+        });
+      }
+
+      function drawWaves() {
+        waves = waves.filter(w => w.alpha > 0);
+        waves.forEach(w => {
+          ctx.strokeStyle = `rgba(255,255,255,${w.alpha})`;
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.arc(w.x, w.y, w.radius, 0, 2 * Math.PI);
+          ctx.stroke();
+          w.radius += w.speed * effectIntensity;
+          w.alpha -= 0.01 * effectIntensity;
+        });
+      }
+
+      function createCircle() {
+        circles.push({
+          x: Math.random() * canvas.width,
+          y: Math.random() * canvas.height,
+          radius: 10 + Math.random() * 30,
+          alpha: 0.3 + Math.random() * 0.3,
+          life: 50 + Math.random() * 100
+        });
+      }
+
+      function drawCircles() {
+        circles = circles.filter(c => c.life > 0);
+        circles.forEach(c => {
+          ctx.strokeStyle = `rgba(255,255,255,${c.alpha})`;
+          ctx.lineWidth = 1 + Math.random() * 2;
+          ctx.beginPath();
+          ctx.arc(c.x, c.y, c.radius, 0, 2 * Math.PI);
+          ctx.stroke();
+          c.life--;
+          c.radius += 0.2 * effectIntensity;
+        });
+      }
+
+      function drawBars() {
+        if (!analyser) return;
+        analyser.getByteFrequencyData(audioData);
+        const barWidth = canvas.width / audioData.length;
+        for (let i = 0; i < audioData.length; i++) {
+          const height = audioData[i] / 255 * canvas.height * 0.3;
+          const x = i * barWidth;
+          const y = canvas.height - height;
+          ctx.fillStyle = `rgba(255,255,255,${0.2 + (audioData[i]/255)*0.8})`;
+          ctx.fillRect(x, y, barWidth - 1, height);
+        }
+      }
+
+      function draw3DRings() {
+        const baseRadius = 50 + Math.sin(angle3D * 2) * 30;
+        ctx.strokeStyle = 'white';
+        
+        for (let i = 0; i < 8; i++) {
+          const offset = i * 30;
+          const radius = baseRadius + offset + pulse * 20;
+          const alpha = 0.3 + (Math.sin(angle3D + i/2) * 0.5 + 0.5) * 0.7;
+          ctx.lineWidth = 0.5 + Math.sin(angle3D + i) * 0.5;
+          
+          ctx.beginPath();
+          for (let j = 0; j < Math.PI * 2; j += 0.1) {
+            const x = canvas.width/2 + Math.cos(j + angle3D + offset/100) * radius;
+            const y = canvas.height/2 + Math.sin(j + offset/50 + angle3D) * radius;
+            if (j === 0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
+          }
+          ctx.stroke();
+        }
+        angle3D += 0.005 * effectIntensity;
+      }
+
+      function drawPulse() {
+        if (!analyser) return;
+        const volume = audioData.reduce((a, b) => a + b, 0) / audioData.length;
+        pulse = (volume / 255) * 2 * volumeBoost;
+        
+        ctx.fillStyle = `rgba(255,255,255,${pulse * 0.1})`;
+        ctx.beginPath();
+        ctx.arc(canvas.width/2, canvas.height/2, pulse * 50, 0, 2 * Math.PI);
+        ctx.fill();
+      }
+
+      function drawAudioLines() {
+        if (!analyser) return;
+        ctx.strokeStyle = 'white';
+        ctx.lineWidth = 1;
+        
+        for (let i = 0; i < audioData.length; i += 4) {
+          const value = audioData[i] / 255;
+          const x1 = i * (canvas.width / audioData.length);
+          const y1 = canvas.height/2 - value * canvas.height/4;
+          const x2 = (i+1) * (canvas.width / audioData.length);
+          const y2 = canvas.height/2 + value * canvas.height/4;
+          
+          ctx.beginPath();
+          ctx.moveTo(x1, y1);
+          ctx.lineTo(x2, y2);
+          ctx.stroke();
+        }
+      }
+
+      // Initialize
+      createParticles(particlesCount);
+      initAudio();
+
+      function animate() {
+        time += 0.01;
+        
+        if (analyser) {
+          analyser.getByteFrequencyData(audioData);
+          const volume = audioData.reduce((a, b) => a + b, 0) / audioData.length;
+          const flashAlpha = flashIntensity + (volume / 255) * 0.3 * volumeBoost;
+          ctx.fillStyle = `rgba(0,0,0,${1-flashAlpha})`;
+        } else {
+          ctx.fillStyle = `rgba(0,0,0,${1-flashIntensity})`;
+        }
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        if (Math.random() < 0.1 * effectIntensity) createLightning();
+        if (Math.random() < 0.2 * effectIntensity) createLine();
+        if (Math.random() < 0.05 * effectIntensity) createWave();
+        if (Math.random() < 0.03 * effectIntensity) createCircle();
+
+        drawBars();
+        drawAudioLines();
+        draw3DRings();
+        drawPulse();
+        drawLightning();
+        drawLines();
+        drawWaves();
+        drawCircles();
+
+        particles.forEach(p => {
+          p.update();
+          p.draw();
+        });
+
+        requestAnimationFrame(animate);
+      }
+
+      animate();
+
+      window.addEventListener('resize', () => {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+      });
+    }
+  </script>
+</body>
+</html>
